@@ -315,6 +315,9 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = (capability // 10 >= 8)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # Lower tt.descriptor_store early so subsequent passes don't choke on it.
+        nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
+        nvidia.passes.hopper.add_tma_store_lowering(pm)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
@@ -328,6 +331,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
+        nvidia.passes.hopper.add_tma_store_lowering(pm)
         passes.ttir.add_loop_aware_cse(pm)
         use_meta_swp_schedule = knobs.nvidia.use_meta_ws and not knobs.nvidia.force_trunk_swp_schedule
         if capability // 10 in [8, 9]:
@@ -359,7 +363,6 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             else:
                 # use Meta's WS internally which supports both hopper and blackwell
-                nvidia.passes.hopper.add_tma_store_lowering(pm)
                 if knobs.nvidia.use_meta_partition:
                     nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 else:

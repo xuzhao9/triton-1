@@ -248,6 +248,49 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
     if (auto *defOp = op.getStep().getDefiningOp())
       addAsyncTaskIds(defOp, allTasks);
   });
+  // Ensure scalar yield operand dependencies that are only assigned to a
+  // single non-default partition are also available in other partitions.
+  // Only add allTasks to ops that are simple scalar arithmetic (not tensor
+  // ops, not channel anchors like MMA/TMEM/loads) to avoid breaking the
+  // Meta WS invariant that channel producers have exactly 1 task ID.
+  funcOp.walk([&](scf::ForOp forOp) {
+    auto yieldOp = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (!yieldOp)
+      return;
+    SmallVector<Operation *> worklist;
+    DenseSet<Operation *> visited;
+    for (Value operand : yieldOp.getOperands()) {
+      if (isa<RankedTensorType>(operand.getType()))
+        continue;
+      if (auto *defOp = operand.getDefiningOp()) {
+        if (defOp->getBlock() == forOp.getBody())
+          worklist.push_back(defOp);
+      }
+    }
+    while (!worklist.empty()) {
+      auto *op = worklist.pop_back_val();
+      if (!visited.insert(op).second)
+        continue;
+      if (op->getBlock() != forOp.getBody())
+        continue;
+      // Only propagate to scalar arith/math ops — these are cheap to
+      // replicate and won't break channel invariants.
+      bool isScalarArithOrMath =
+          isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
+          llvm::none_of(op->getResultTypes(),
+                        [](Type t) { return isa<RankedTensorType>(t); });
+      if (!isScalarArithOrMath)
+        continue;
+      addAsyncTaskIds(op, allTasks);
+      for (Value operand : op->getOperands()) {
+        if (isa<RankedTensorType>(operand.getType()))
+          continue;
+        if (auto *defOp = operand.getDefiningOp())
+          worklist.push_back(defOp);
+      }
+    }
+  });
+
   // The parent operations must have the union of their children's operations.
   // We do this in a separate walk to avoid having a parent operation treated
   // like an anchor op and skipped by the first walk.

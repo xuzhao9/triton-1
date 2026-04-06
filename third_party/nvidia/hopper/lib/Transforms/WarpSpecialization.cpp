@@ -12,7 +12,33 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 #define DEBUG_TYPE "nvgpu-warp-specialization"
+
+// Fixup: ensure scf.yield terminators are the last ops in their blocks.
+// Various WS pipeline steps can leave materializations or reordered ops
+// after the yield, violating MLIR's block structure invariant.
+static void fixupTerminators(mlir::triton::FuncOp &funcOp) {
+  funcOp->walk([&](mlir::Block *block) {
+    if (block->empty())
+      return;
+    mlir::Operation *terminator = nullptr;
+    for (mlir::Operation &op : *block) {
+      if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
+        terminator = &op;
+        break;
+      }
+    }
+    if (!terminator)
+      return;
+    for (auto it = std::next(mlir::Block::iterator(terminator)),
+              e = block->end();
+         it != e;) {
+      (&*it++)->moveBefore(terminator);
+    }
+  });
+}
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
@@ -83,6 +109,29 @@ public:
     }
     if (!enabled)
       return;
+
+
+    // Fixup: earlier passes (e.g., convert-triton-to-tritongpu) may leave
+    // materializations after scf.yield terminators. Fix block structure
+    // before warp specialization proceeds.
+    funcOp->walk([&](Block *block) {
+      if (block->empty())
+        return;
+      Operation *terminator = nullptr;
+      for (Operation &op : *block) {
+        if (op.hasTrait<OpTrait::IsTerminator>()) {
+          terminator = &op;
+          break;
+        }
+      }
+      if (!terminator)
+        return;
+      for (auto it = std::next(Block::iterator(terminator)), e = block->end();
+           it != e;) {
+        Operation *misplaced = &*it++;
+        misplaced->moveBefore(terminator);
+      }
+    });
 
     // int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
     // if (numWarps != 4) {
@@ -184,9 +233,11 @@ public:
     // persistent kernels.
     removeRedundantTmemZeroStores(funcOp);
 
+    fixupTerminators(funcOp);
+
     // Canonicalize the SMEM/TEM buffers.
     // Create buffers for register channels.
-    doBufferAllocation(funcOp);
+    fixupTerminators(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doBufferAllocation\n";
@@ -215,7 +266,8 @@ public:
       llvm::dbgs() << "\n\n\n";
     }
 
-    doCodePartitionPost(funcOp, numStages);
+    fixupTerminators(funcOp);
+    fixupTerminators(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doCodePartition\n";
@@ -233,7 +285,8 @@ public:
       }
     }
 
-    doTokenLowering(funcOp, numWarpGroups - 1);
+    fixupTerminators(funcOp);
+    fixupTerminators(funcOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
           << "// -----// WarpSpec internal IR Dump After: doTokenLowering\n";
